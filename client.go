@@ -1,136 +1,156 @@
 package stellorbit
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
-	"net/http"
-	"net/url"
-	"strings"
-	"time"
-)
+	"sync/atomic"
 
-const (
-	defaultTimeout    = 10 * time.Second
-	apiKeyHeader      = "X-Stellorbit-Api-Key"
-	contentTypeHeader = "Content-Type"
-	acceptHeader      = "Accept"
-	userAgentHeader   = "User-Agent"
-	applicationJSON   = "application/json"
-	defaultUserAgent  = "stellorbit-go-sdk"
+	stellnula "github.com/stellhub/stellnula-go-sdk"
+	"github.com/stellhub/stellorbit-go-sdk/governance"
+	"github.com/stellhub/stellorbit-go-sdk/internal/httpapi"
+	stellnulasource "github.com/stellhub/stellorbit-go-sdk/internal/source/stellnula"
 )
-
-var ErrEndpointRequired = errors.New("stellorbit: endpoint is required")
 
 type Client struct {
-	options    Options
-	httpClient *http.Client
+	options                Options
+	httpClient             *httpapi.Client
+	ruleSource             governance.Source
+	routeProvider          governance.RouteRuleProvider
+	circuitBreakerProvider governance.CircuitBreakerRuleProvider
+	authorizationProvider  governance.AuthorizationRuleProvider
+	rateLimitProvider      governance.RateLimitRuleProvider
+	started                atomic.Bool
 }
 
-type Options struct {
-	Endpoint   string
-	APIKey     string
-	Timeout    time.Duration
-	HTTPClient *http.Client
-}
-
-func NewClient(options Options) (*Client, error) {
-	normalized, err := options.normalize()
+func NewClient(options Options, opts ...Option) (*Client, error) {
+	settings := clientSettings{}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&settings)
+		}
+	}
+	normalized, err := options.normalize(settings.ruleSource != nil)
 	if err != nil {
 		return nil, err
 	}
-	return &Client{
+	source := settings.ruleSource
+	if source == nil {
+		if normalized.StellnulaEndpoint != "" {
+			source, err = newStellnulaSource(normalized, settings.stellnulaClientOptions...)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			source = governance.NewInMemorySource(governance.EmptyRegistry())
+		}
+	}
+	client := &Client{
 		options:    normalized,
-		httpClient: normalized.HTTPClient,
-	}, nil
+		ruleSource: source,
+	}
+	if normalized.Endpoint != "" {
+		client.httpClient = httpapi.NewClient(httpapi.Options{
+			Endpoint:   normalized.Endpoint,
+			APIKey:     normalized.APIKey,
+			HTTPClient: normalized.HTTPClient,
+		})
+	}
+	client.routeProvider = governance.NewRouteRuleProvider(client.Rules)
+	client.circuitBreakerProvider = governance.NewCircuitBreakerRuleProvider(client.Rules)
+	client.authorizationProvider = governance.NewAuthorizationRuleProvider(client.Rules)
+	client.rateLimitProvider = governance.NewRateLimitRuleProvider(client.Rules)
+	return client, nil
+}
+
+func (c *Client) Start(ctx context.Context) error {
+	if !c.started.CompareAndSwap(false, true) {
+		return nil
+	}
+	if err := c.ruleSource.Start(ctx); err != nil {
+		c.started.Store(false)
+		return err
+	}
+	return nil
+}
+
+func (c *Client) Close() error {
+	return c.ruleSource.Close()
+}
+
+func (c *Client) Rules() governance.Registry {
+	return c.ruleSource.Registry()
+}
+
+func (c *Client) Routes() governance.RouteRuleProvider {
+	return c.routeProvider
+}
+
+func (c *Client) CircuitBreakers() governance.CircuitBreakerRuleProvider {
+	return c.circuitBreakerProvider
+}
+
+func (c *Client) Authorizations() governance.AuthorizationRuleProvider {
+	return c.authorizationProvider
+}
+
+func (c *Client) RateLimits() governance.RateLimitRuleProvider {
+	return c.rateLimitProvider
 }
 
 func (c *Client) Route(ctx context.Context, request RouteRequest) (*APIResponse, error) {
-	payload, err := json.Marshal(request)
-	if err != nil {
-		return nil, fmt.Errorf("marshal route request: %w", err)
-	}
-	httpRequest, err := c.newRequest(ctx, http.MethodPost, "/api/stellorbit/v1/routes/decide", bytes.NewReader(payload))
+	httpClient, err := c.compatHTTPClient()
 	if err != nil {
 		return nil, err
 	}
-	httpRequest.Header.Set(contentTypeHeader, applicationJSON)
-	return c.send(httpRequest)
+	return httpClient.Route(ctx, request)
 }
 
 func (c *Client) LifecyclePolicy(ctx context.Context, serviceName string) (*APIResponse, error) {
-	path := "/api/stellorbit/v1/services/" + url.PathEscape(serviceName) + "/lifecycle-policy"
-	request, err := c.newRequest(ctx, http.MethodGet, path, nil)
+	httpClient, err := c.compatHTTPClient()
 	if err != nil {
 		return nil, err
 	}
-	return c.send(request)
+	return httpClient.LifecyclePolicy(ctx, serviceName)
 }
 
 func (c *Client) TrafficPolicy(ctx context.Context, serviceName string) (*APIResponse, error) {
-	path := "/api/stellorbit/v1/services/" + url.PathEscape(serviceName) + "/traffic-policy"
-	request, err := c.newRequest(ctx, http.MethodGet, path, nil)
+	httpClient, err := c.compatHTTPClient()
 	if err != nil {
 		return nil, err
 	}
-	return c.send(request)
+	return httpClient.TrafficPolicy(ctx, serviceName)
 }
 
-func (c *Client) newRequest(ctx context.Context, method string, path string, body io.Reader) (*http.Request, error) {
-	request, err := http.NewRequestWithContext(ctx, method, c.resolve(path), body)
-	if err != nil {
-		return nil, fmt.Errorf("create stellorbit request: %w", err)
+func (c *Client) compatHTTPClient() (*httpapi.Client, error) {
+	if c.httpClient == nil {
+		return nil, ErrEndpointRequired
 	}
-	request.Header.Set(acceptHeader, applicationJSON)
-	request.Header.Set(userAgentHeader, defaultUserAgent)
-	if c.options.APIKey != "" {
-		request.Header.Set(apiKeyHeader, c.options.APIKey)
-	}
-	return request, nil
+	return c.httpClient, nil
 }
 
-func (c *Client) send(request *http.Request) (*APIResponse, error) {
-	response, err := c.httpClient.Do(request)
-	if err != nil {
-		return nil, fmt.Errorf("call stellorbit service: %w", err)
+func newStellnulaSource(options Options, clientOptions ...stellnula.ClientOption) (governance.Source, error) {
+	if options.StellnulaEndpoint == "" {
+		return nil, fmt.Errorf("stellorbit: stellnula endpoint is required for governance rule source")
 	}
-	defer response.Body.Close()
-
-	body, err := io.ReadAll(response.Body)
-	if err != nil {
-		return nil, fmt.Errorf("read stellorbit response: %w", err)
-	}
-
-	apiResponse := &APIResponse{
-		StatusCode: response.StatusCode,
-		Body:       string(body),
-	}
-	if !apiResponse.Successful() {
-		return apiResponse, &HTTPError{StatusCode: response.StatusCode, Body: string(body)}
-	}
-	return apiResponse, nil
-}
-
-func (c *Client) resolve(path string) string {
-	base := strings.TrimRight(c.options.Endpoint, "/")
-	return base + path
-}
-
-func (o Options) normalize() (Options, error) {
-	if o.Endpoint == "" {
-		return Options{}, ErrEndpointRequired
-	}
-	if _, err := url.ParseRequestURI(o.Endpoint); err != nil {
-		return Options{}, fmt.Errorf("stellorbit: invalid endpoint: %w", err)
-	}
-	if o.Timeout == 0 {
-		o.Timeout = defaultTimeout
-	}
-	if o.HTTPClient == nil {
-		o.HTTPClient = &http.Client{Timeout: o.Timeout}
-	}
-	return o, nil
+	return stellnulasource.New(stellnulasource.Options{
+		Endpoint:                 options.StellnulaEndpoint,
+		GRPCEndpoint:             options.StellnulaGRPCEndpoint,
+		GRPCPlaintext:            options.StellnulaGRPCPlaintext,
+		APIToken:                 options.StellnulaAPIToken,
+		AppID:                    options.AppID,
+		ClientID:                 options.ClientID,
+		Env:                      options.Env,
+		Region:                   options.Region,
+		Zone:                     options.Zone,
+		Cluster:                  options.Cluster,
+		Namespace:                options.RuleNamespace,
+		Group:                    options.RuleGroup,
+		WatchEnabled:             options.WatchEnabled,
+		FailFastOnBootstrap:      options.FailFastOnBootstrap,
+		SnapshotDirectory:        options.SnapshotDirectory,
+		Labels:                   options.Labels,
+		AcceptLargeFileReference: options.AcceptLargeFileReference,
+		Logger:                   options.Logger,
+		HTTPClient:               options.HTTPClient,
+	}, clientOptions...)
 }
