@@ -1,5 +1,7 @@
 # StellOrbit Go SDK
 
+English | [简体中文](./README_CN.md)
+
 `stellorbit-go-sdk` is the Go client SDK for [`stellhub/stellorbit-service`](https://github.com/stellhub/stellorbit-service), the Stell service governance engine responsible for routing, load balancing, retries, traffic shifting, and service lifecycle policies.
 
 It consumes governance rules from [`stellnula-service`](https://github.com/stellhub/stellnula-service) through [`stellnula-go-sdk`](https://github.com/stellhub/stellnula-go-sdk), keeps a local immutable rule registry, and exposes rule providers for Go applications and middleware adapters.
