@@ -137,6 +137,12 @@ func TestProvidersReturnMatchedGovernanceRules(t *testing.T) {
 			"targetService": "payment-service",
 			"status": "ACTIVE",
 			"priority": 0,
+			"limitMode": "QPS",
+			"limitType": "TENANT",
+			"limitAlgorithm": "TOKEN_BUCKET",
+			"trafficProtocol": "HTTP",
+			"executionLocation": "APPLICATION",
+			"coordinationMode": "LOCAL_ONLY",
 			"limit": {"quota": 100, "windowSeconds": 60, "keyAttribute": "tenantId"}
 		}`),
 		mustParseRule(t, "breaker-payment", `{
@@ -214,6 +220,189 @@ func TestProvidersReturnMatchedGovernanceRules(t *testing.T) {
 	}
 	if !ok || breakerRule.RuleID != "breaker-payment" {
 		t.Fatalf("unexpected breaker rule: %#v %v", breakerRule, ok)
+	}
+}
+
+func TestRateLimitProviderFiltersEnterpriseLimiterModes(t *testing.T) {
+	rules := []GovernanceRule{
+		mustParseRule(t, "rate-local-qps", `{
+			"ruleType": "RATE_LIMIT",
+			"targetService": "payment-service",
+			"status": "ACTIVE",
+			"priority": 0,
+			"limitMode": "QPS",
+			"limitType": "REQUEST",
+			"limitAlgorithm": "TOKEN_BUCKET",
+			"trafficProtocol": "HTTP",
+			"executionLocation": "APPLICATION",
+			"coordinationMode": "LOCAL_ONLY",
+			"keyExtractor": {
+				"keys": [{"name": "tenant", "source": "TENANT", "key": "tenantId", "required": true}]
+			},
+			"limit": {"quota": 100, "windowSeconds": 60}
+		}`),
+		mustParseRule(t, "rate-grpc-header-global", `{
+			"ruleType": "RATE_LIMIT",
+			"targetService": "payment-service",
+			"status": "ACTIVE",
+			"priority": 1,
+			"limitMode": "HEADER",
+			"limitType": "HEADER",
+			"limitAlgorithm": "QUOTA_LEASE",
+			"trafficProtocol": "GRPC",
+			"executionLocation": "APPLICATION",
+			"coordinationMode": "GLOBAL_QUOTA",
+			"requestMatcher": {"grpcService": "payment.PaymentService"},
+			"keyExtractor": {
+				"keys": [{"name": "region", "source": "GRPC_METADATA", "key": "x-region", "required": true, "normalize": "LOWERCASE"}]
+			},
+			"quotaConfig": {"quota": 500},
+			"observabilityConfig": {"metrics": true},
+			"shadowConfig": {"enabled": false},
+			"limit": {"quota": 500, "windowSeconds": 60}
+		}`),
+		mustParseRule(t, "rate-global-qps", `{
+			"ruleType": "RATE_LIMIT",
+			"targetService": "payment-service",
+			"status": "ACTIVE",
+			"priority": 2,
+			"limitMode": "QPS",
+			"limitType": "REQUEST",
+			"limitAlgorithm": "QUOTA_LEASE",
+			"trafficProtocol": "HTTP",
+			"executionLocation": "APPLICATION",
+			"coordinationMode": "GLOBAL_QUOTA",
+			"limit": {"quota": 200, "windowSeconds": 60}
+		}`),
+	}
+	client, err := NewClient(
+		Options{},
+		WithRuleSource(NewInMemoryGovernanceRuleSource(NewGovernanceRuleRegistry(1, "test", rules))),
+	)
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+	if err := client.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	headerRules, err := client.RateLimits().Find(context.Background(), NewRateLimitRuleQuery(
+		"payment-service",
+		ByLimitMode(LimitModeHeader),
+		ByProtocol(TrafficProtocolGRPC),
+		ByKeyExtractorSource(KeyExtractorSourceGRPCMetadata),
+		DistributedOnly(),
+	))
+	if err != nil {
+		t.Fatalf("find header rules: %v", err)
+	}
+	if len(headerRules) != 1 || headerRules[0].RuleID != "rate-grpc-header-global" {
+		t.Fatalf("unexpected header rules: %#v", headerRules)
+	}
+
+	localRules, err := client.RateLimits().Find(context.Background(), NewRateLimitRuleQuery("payment-service", LocalOnly()))
+	if err != nil {
+		t.Fatalf("find local rules: %v", err)
+	}
+	if len(localRules) != 1 || localRules[0].RuleID != "rate-local-qps" {
+		t.Fatalf("unexpected local rules: %#v", localRules)
+	}
+
+	globalRules, err := client.RateLimits().Find(context.Background(), NewRateLimitRuleQuery(
+		"payment-service",
+		ByLimitMode(LimitModeQPS),
+		DistributedOnly(),
+	))
+	if err != nil {
+		t.Fatalf("find global rules: %v", err)
+	}
+	if len(globalRules) != 1 || globalRules[0].RuleID != "rate-global-qps" {
+		t.Fatalf("unexpected global distributed rules: %#v", globalRules)
+	}
+	globalView, ok := globalRules[0].RateLimit()
+	if !ok {
+		t.Fatal("expected global rule to expose rate limit view")
+	}
+	if globalView.LimitMode != LimitModeQPS || !globalView.IsDistributedRule() {
+		t.Fatalf("unexpected global rate limit view: %#v", globalView)
+	}
+}
+
+func TestRateLimitRuleUnmarshalEnterpriseFields(t *testing.T) {
+	var rule RateLimitRule
+	if err := json.Unmarshal([]byte(`{
+		"limitMode": "MODEL",
+		"limitType": "MODEL_TOKEN",
+		"limitAlgorithm": "ADAPTIVE",
+		"trafficProtocol": "MODEL",
+		"executionLocation": "GATEWAY",
+		"coordinationMode": "GLOBAL_SYNC",
+		"targetSelector": {"service": "chat-service"},
+		"requestMatcher": {"path": "/v1/chat/completions"},
+		"keyExtractor": {
+			"keys": [
+				{"name": "api-key", "source": "API_KEY", "key": "Authorization", "required": true, "normalize": "HASH"},
+				{"name": "custom", "source": "PLUGIN_CONTEXT", "key": "pluginKey"}
+			]
+		},
+		"dimensions": [{"name": "tenant"}],
+		"quotaConfig": {"quota": 1000},
+		"windowConfig": {"seconds": 60},
+		"burstConfig": {"capacity": 200},
+		"concurrencyConfig": {"max": 10},
+		"hotspotConfig": {"topN": 20},
+		"customPolicy": {"type": "EXPRESSION"},
+		"modelLimitConfig": {"unit": "token"},
+		"fallbackPolicy": {"strategy": "FAIL_OPEN"},
+		"responsePolicy": {"status": 429},
+		"observabilityConfig": {"metrics": true},
+		"shadowConfig": {"enabled": true}
+	}`), &rule); err != nil {
+		t.Fatalf("unmarshal enterprise rate limit rule: %v", err)
+	}
+	if rule.LimitMode != LimitModeModel || rule.LimitType != LimitTypeModelToken || rule.LimitAlgorithm != LimitAlgorithmAdaptive {
+		t.Fatalf("unexpected model limit fields: %#v", rule)
+	}
+	if rule.TrafficProtocol != TrafficProtocolModel || rule.ExecutionLocation != ExecutionLocationGateway {
+		t.Fatalf("unexpected protocol or execution location: %#v", rule)
+	}
+	if !rule.IsDistributedRule() {
+		t.Fatalf("expected global sync rule to be distributed: %#v", rule)
+	}
+	if len(rule.RequestMatcher) == 0 || len(rule.QuotaConfig) == 0 || len(rule.ModelLimitConfig) == 0 {
+		t.Fatalf("expected structured config maps: %#v", rule)
+	}
+	if len(rule.KeyExtractor.Keys) != 2 {
+		t.Fatalf("expected key extractor keys, got %#v", rule.KeyExtractor.Keys)
+	}
+	unsupported := rule.UnsupportedKeyExtractorSources()
+	if len(unsupported) != 1 || unsupported[0].Source != KeyExtractorSource("PLUGIN_CONTEXT") {
+		t.Fatalf("expected unsupported key source to be marked, got %#v", unsupported)
+	}
+}
+
+func TestParserRejectsUnknownRateLimitEnum(t *testing.T) {
+	configID, payload := mustAggregatePayload(t, "rate-unknown", `{
+		"ruleType": "RATE_LIMIT",
+		"targetService": "payment-service",
+		"status": "ACTIVE",
+		"priority": 0,
+		"limitMode": "QPSS",
+		"limitType": "REQUEST",
+		"limitAlgorithm": "TOKEN_BUCKET",
+		"trafficProtocol": "HTTP",
+		"executionLocation": "APPLICATION",
+		"coordinationMode": "LOCAL_ONLY",
+		"limit": {"quota": 100, "windowSeconds": 60}
+	}`)
+	_, err := NewGovernanceRuleParser().Parse(governance.Entry{
+		ConfigID:  configID,
+		ConfigKey: configID,
+		Value:     payload,
+		Revision:  1,
+	}, "test")
+	if err == nil {
+		t.Fatal("expected unknown rate limit enum to be rejected")
 	}
 }
 
@@ -295,6 +484,12 @@ func TestSnapshotParserKeepsFallbackAndRemovesDeletedRule(t *testing.T) {
 		"targetService": "payment-service",
 		"status": "ACTIVE",
 		"priority": 0,
+		"limitMode": "QPS",
+		"limitType": "REQUEST",
+		"limitAlgorithm": "TOKEN_BUCKET",
+		"trafficProtocol": "HTTP",
+		"executionLocation": "APPLICATION",
+		"coordinationMode": "LOCAL_ONLY",
 		"limit": {"quota": 100}
 	}`)
 	aggregateConfigID := previousRule.ConfigKey

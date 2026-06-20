@@ -117,7 +117,17 @@ type defaultRateLimitRuleProvider struct {
 }
 
 func (p *defaultRateLimitRuleProvider) Find(ctx context.Context, query RateLimitRuleQuery) ([]Rule, error) {
-	return p.support.find(ctx, []RuleType{RuleTypeRateLimit}, query.ServiceName, query.AttributesForMatch())
+	rules, err := p.support.find(ctx, []RuleType{RuleTypeRateLimit}, query.ServiceName, query.AttributesForMatch())
+	if err != nil {
+		return nil, err
+	}
+	matched := make([]Rule, 0, len(rules))
+	for _, rule := range rules {
+		if rateLimitRuleMatchesQuery(rule, query) {
+			matched = append(matched, rule)
+		}
+	}
+	return matched, nil
 }
 
 func (p *defaultRateLimitRuleProvider) First(ctx context.Context, query RateLimitRuleQuery) (Rule, bool, error) {

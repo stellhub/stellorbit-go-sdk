@@ -62,6 +62,14 @@ func NewRule(rule Rule) (Rule, error) {
 		return Rule{}, fmt.Errorf("governance rule priority must be greater than or equal to 0")
 	}
 	rule.Content = copyAnyMap(rule.Content)
+	if rule.RuleType == RuleTypeRateLimit {
+		if err := requireRulePayload(rule.RuleType, rule.Content); err != nil {
+			return Rule{}, err
+		}
+		if err := validateRateLimitContent(rule.Content); err != nil {
+			return Rule{}, err
+		}
+	}
 	return rule, nil
 }
 

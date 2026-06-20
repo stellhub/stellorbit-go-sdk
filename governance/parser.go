@@ -166,9 +166,13 @@ func parseAggregatedRule(entry Entry, root, ruleNode map[string]any, rootRuleTyp
 	if aggregateChecksum != "" {
 		mergedContent["aggregateChecksum"] = aggregateChecksum
 	}
-
 	if err := requireRulePayload(ruleType, mergedContent); err != nil {
 		return Rule{}, err
+	}
+	if ruleType == RuleTypeRateLimit {
+		if err := validateRateLimitContent(mergedContent); err != nil {
+			return Rule{}, err
+		}
 	}
 	rawContent, err := marshalJSON(mergedContent)
 	if err != nil {

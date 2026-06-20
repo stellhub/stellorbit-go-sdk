@@ -87,9 +87,16 @@ func (q AuthorizationRuleQuery) AttributesForMatch() map[string]string {
 }
 
 type RateLimitRuleQuery struct {
-	ServiceName string
-	QuotaKey    string
-	Context     RequestContext
+	ServiceName        string
+	QuotaKey           string
+	LimitMode          LimitMode
+	TrafficProtocol    TrafficProtocol
+	ExecutionLocation  ExecutionLocation
+	CoordinationMode   CoordinationMode
+	KeyExtractorSource KeyExtractorSource
+	DistributedOnly    bool
+	LocalOnly          bool
+	Context            RequestContext
 }
 
 func (q RateLimitRuleQuery) AttributesForMatch() map[string]string {
